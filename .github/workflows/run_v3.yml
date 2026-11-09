@@ -1,18 +1,21 @@
+
 name: resign_v3
 
 on:
   workflow_dispatch:
     inputs:
-      ZIP_URL:    
-        description: 'URL of (splloader)+uboot+sml+trustos+(teecfg)+vbmeta+boot+(recovery) (all end with .bin)'
+      ZIP_URL:
+        description: 'URL of original.zip containing the original firmware images'
         required: true
         default: ''
       EXTRA_KEY_TREE_URL:
         description: 'EXTRA_KEY_TREE_URL (leave blank if you only use unisoc keys)'
         required: false
+        default: ''
       EXTRA_KEY_BRANCH:
         description: 'EXTRA_KEY_BRANCH (leave blank if you only use unisoc keys)'
         required: false
+        default: ''
       antiroll:
         description: 'anti-rollback version (trusted_version) for BSP signing'
         required: false
@@ -21,8 +24,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    # Required by softprops/action-gh-release to create a Release.
+    permissions:
+      contents: write
+
     steps:
-    
+
     - name: Checkout
       uses: actions/checkout@v7
       with:
@@ -33,44 +41,67 @@ jobs:
       if: ${{ startsWith(github.event.inputs.EXTRA_KEY_TREE_URL, 'git@github.com') }}
       uses: webfactory/ssh-agent@v0.10.0
       with:
-          ssh-private-key: |
-            ${{ secrets.SSH_PRIVATE_KEY }}
+        ssh-private-key: |
+          ${{ secrets.SSH_PRIVATE_KEY }}
 
     - name: Clone extra keys
-      if: |
-        github.event.inputs.EXTRA_KEY_TREE_URL != null
-        && github.event.inputs.EXTRA_KEY_BRANCH != null
+      if: ${{ github.event.inputs.EXTRA_KEY_TREE_URL != '' && github.event.inputs.EXTRA_KEY_BRANCH != '' }}
+      env:
+        EXTRA_KEY_TREE_URL: ${{ github.event.inputs.EXTRA_KEY_TREE_URL }}
+        EXTRA_KEY_BRANCH: ${{ github.event.inputs.EXTRA_KEY_BRANCH }}
       run: |
-        git clone ${{ github.event.inputs.EXTRA_KEY_TREE_URL }} -b ${{ github.event.inputs.EXTRA_KEY_BRANCH }} ./extra_key
+        git clone --branch "$EXTRA_KEY_BRANCH" "$EXTRA_KEY_TREE_URL" ./extra_key
 
     - name: patch
       env:
         ANTIROLL: "${{ github.event.inputs.antiroll }}"
+        ZIP_URL: "${{ github.event.inputs.ZIP_URL }}"
       run: |
         sudo apt update
         sudo apt -y install build-essential openssl curl wget busybox xz-utils python3
-        # install static 7zz used by the scripts instead of busybox unzip:
-        # latest official ip7z/7zip linux-x64 release (resolved via GitHub API),
-        # falling back to the mcmilk/7-Zip-zstd nightly linux-clang-x64 build
+
+        # Install static 7zz
         chmod +x main/setup-7zz.sh
         ./main/setup-7zz.sh
-        # build avbctl, the static C replacement for the python2 avbtool
-        # (fetches mbedtls-3.6 and links it statically)
+
+        # Build avbctl
         make -C main/avbctl
-        curl -o original.zip -L "${{ github.event.inputs.ZIP_URL }}"
+
+        # Download original firmware archive
+        curl --fail --location --show-error --retry 3 --retry-all-errors -o original.zip "$ZIP_URL"
+        test -s original.zip
+
+        # Download latest official Magisk APK
         curl -o magisk.apk -L $(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases | grep -Po -m 1 '(?<=download_url\"\: \").*Magisk.*Magisk.*apk')
+        test -s magisk.apk
+
+        # Download magiskboot
         wget https://raw.githubusercontent.com/magojohnji/magiskboot-linux/main/x86_64/magiskboot
         chmod +x magiskboot
+
+        # Prepare scripts
         chmod +x main/*.sh
         mv main/sign_v3.sh ./
-        if ! [[ "$ANTIROLL" =~ ^[0-9]+$ ]]; then echo "antiroll must be a non-negative integer"; exit 1; fi
+
+        # Validate antiroll
+        if ! [[ "$ANTIROLL" =~ ^[0-9]+$ ]]; then
+          echo "antiroll must be a non-negative integer"
+          exit 1
+        fi
+
         sed -i "s/trusted_version=.*/trusted_version=$ANTIROLL/" main/config/version.cfg
+
+        # Run V3 signing process
         ./sign_v3.sh
+
+        # Verify output archive exists
+        test -s resigned.zip
+        7zz t resigned.zip
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v3
       with:
-        files: | 
+        files: |
           resigned.zip
         name: ${{ github.run_id }}
         tag_name: ${{ github.run_id }}
